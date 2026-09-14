@@ -176,8 +176,11 @@ std::vector<std::unique_ptr<cudf::io::datasource>> make_datasources(source_info 
             return cudf::io::datasource::create(fs.path, offset, max_size_estimate, fs.size);
           }));
         }
-        cudf::detail::get_all_futures(
-          source_tasks, [&](auto source) { sources.emplace_back(std::move(source)); });
+        // GCC 14.2 ICEs (cxx_eval_indirect_ref) folding emplace_back inside a generic lambda here.
+        cudf::detail::get_all_futures(source_tasks,
+                                      [&](std::unique_ptr<cudf::io::datasource> source) {
+                                        sources.emplace_back(std::move(source));
+                                      });
       } else {
         for (auto const& fs : info.filepath_sources()) {
           sources.emplace_back(

@@ -20,6 +20,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
+#include <cudf/utilities/type_checks.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
@@ -31,12 +32,161 @@
 #include <thrust/fill.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/sequence.h>
+#include <cuda/atomic>
 
 #include <memory>
 #include <optional>
 
 namespace cudf {
 namespace detail {
+
+namespace {
+template <typename Hasher>
+CUDF_KERNEL void mixed_left_build(Hasher hash,
+                                  size_type rows,
+                                  size_type* heads,
+                                  size_type* next,
+                                  std::size_t mask)
+{
+  auto const row = cudf::detail::grid_1d::global_thread_id<256>();
+  if (row >= rows) { return; }
+  auto& head = heads[hash(row) & mask];
+  next[row] = cuda::atomic_ref<size_type, cuda::thread_scope_device>{head}.exchange(
+    row, cuda::memory_order_relaxed);
+}
+
+template <typename Hasher, typename Equal>
+CUDF_KERNEL void mixed_left_consume(Hasher hash,
+                                    Equal equal,
+                                    table_device_view left,
+                                    table_device_view right,
+                                    size_type const* heads,
+                                    size_type const* next,
+                                    std::size_t mask,
+                                    uint32_t* matches,
+                                    ast::detail::expression_device_view expression)
+{
+  extern __shared__ char raw_intermediates[];
+  auto* intermediates = reinterpret_cast<ast::detail::IntermediateDataType<true>*>(raw_intermediates) +
+                        threadIdx.x * expression.num_intermediates;
+  auto const evaluator = ast::detail::expression_evaluator<true>(left, right, expression);
+  auto const right_row = cudf::detail::grid_1d::global_thread_id<128>();
+  if (right_row >= right.num_rows()) { return; }
+  for (auto left_row = heads[hash(right_row) & mask]; left_row != JoinNoMatch;
+       left_row = next[left_row]) {
+    if (!equal(row::lhs_index_type{left_row}, row::rhs_index_type{right_row})) { continue; }
+    auto matched = cuda::atomic_ref<uint32_t, cuda::thread_scope_device>{matches[left_row]};
+    if (matched.load(cuda::memory_order_relaxed) != 0) { continue; }
+    auto result = ast::detail::value_expression_result<bool, true>();
+    evaluator.evaluate(result, left_row, right_row, 0, intermediates);
+    if (result.is_valid() && result.value()) { matched.store(1, cuda::memory_order_relaxed); }
+  }
+}
+
+std::size_t mixed_left_bucket_count(size_type rows)
+{
+  std::size_t count = 1;
+  while (count < static_cast<std::size_t>(rows)) { count *= 2; }
+  return count;
+}
+}  // namespace
+
+class mixed_left_join_state {
+ public:
+  mixed_left_join_state(table_view const& left_equality,
+                        table_view const& left_conditional,
+                        null_equality compare_nulls,
+                        rmm::cuda_stream_view stream,
+                        rmm::device_async_resource_ref mr)
+    : _left{left_equality},
+      _conditional{left_conditional},
+      _nulls{compare_nulls},
+      _preprocessed{row::equality::preprocessed_table::create(left_equality, stream, mr)},
+      _conditional_device{table_device_view::create(left_conditional, stream, mr)},
+      _heads{mixed_left_bucket_count(left_equality.num_rows()), stream, mr},
+      _next{static_cast<std::size_t>(left_equality.num_rows()), stream, mr},
+      _matches{static_cast<std::size_t>(left_equality.num_rows()), stream, mr}
+  {
+    CUDF_EXPECTS(_left.num_columns() > 0, "mixed left state requires equality keys");
+    CUDF_EXPECTS(_left.num_rows() == _conditional.num_rows(), "left table row counts differ");
+    CUDF_EXPECTS(!cudf::has_nested_columns(_left), "nested mixed equality keys are unsupported");
+    thrust::fill(rmm::exec_policy_nosync(stream, mr), _heads.begin(), _heads.end(), JoinNoMatch);
+    thrust::fill(rmm::exec_policy_nosync(stream, mr), _matches.begin(), _matches.end(), uint32_t{0});
+    if (_left.num_rows() == 0) { return; }
+    auto hash = row::hash::row_hasher{_preprocessed}.device_hasher(nullate::YES{});
+    auto config = grid_1d{_left.num_rows(), 256};
+    mixed_left_build<<<config.num_blocks, 256, 0, stream.value()>>>(
+      hash, _left.num_rows(), _heads.data(), _next.data(), _heads.size() - 1);
+    CUDF_CUDA_TRY(cudaGetLastError());
+  }
+
+  void consume(table_view const& right_equality,
+               table_view const& right_conditional,
+               ast::expression const& predicate,
+               rmm::cuda_stream_view stream,
+               rmm::device_async_resource_ref mr)
+  {
+    CUDF_EXPECTS(!_sealed, "mixed left state is already sealed");
+    CUDF_EXPECTS(right_equality.num_rows() == right_conditional.num_rows(), "right row counts differ");
+    CUDF_EXPECTS(have_same_types(_left, right_equality), "mixed equality key types differ");
+    auto parser = ast::detail::expression_parser{
+      predicate, _conditional, right_conditional, nullate::YES{}, stream, mr};
+    CUDF_EXPECTS(parser.output_type().id() == type_id::BOOL8, "mixed predicate must return boolean");
+    if (_left.num_rows() == 0 || right_equality.num_rows() == 0) { return; }
+    auto right = row::equality::preprocessed_table::create(right_equality, stream, mr);
+    auto conditional = table_device_view::create(right_conditional, stream, mr);
+    auto hash = row::hash::row_hasher{right}.device_hasher(nullate::YES{});
+    auto equal = row::equality::two_table_comparator{_preprocessed, right}.equal_to<false>(
+      nullate::YES{}, _nulls);
+    auto config = grid_1d{right_equality.num_rows(), 128};
+    auto const shared_bytes = 128 * parser.shmem_per_thread;
+    mixed_left_consume<<<config.num_blocks, 128, shared_bytes, stream.value()>>>(
+      hash, equal, *_conditional_device, *conditional, _heads.data(), _next.data(),
+      _heads.size() - 1, _matches.data(), parser.device_expression_data);
+    CUDF_CUDA_TRY(cudaGetLastError());
+  }
+
+  void seal(bool anti, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  {
+    CUDF_EXPECTS(!_sealed, "mixed left state is already sealed");
+    _output_size = thrust::count(rmm::exec_policy(stream, mr), _matches.begin(), _matches.end(),
+                                 anti ? uint32_t{0} : uint32_t{1});
+    _anti = anti;
+    _sealed = true;
+  }
+
+  std::size_t output_size() const
+  {
+    CUDF_EXPECTS(_sealed, "mixed left state must be sealed before output");
+    return _output_size;
+  }
+
+  std::unique_ptr<rmm::device_uvector<size_type>> materialize_indices(
+    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+  {
+    auto output = std::make_unique<rmm::device_uvector<size_type>>(output_size(), stream, mr);
+    auto matches = _matches.data();
+    auto wanted = _anti ? uint32_t{0} : uint32_t{1};
+    thrust::copy_if(rmm::exec_policy_nosync(stream, mr),
+                    thrust::counting_iterator<size_type>{0},
+                    thrust::counting_iterator<size_type>{_left.num_rows()}, output->begin(),
+                    [matches, wanted] __device__(size_type row) { return matches[row] == wanted; });
+    return output;
+  }
+
+ private:
+  table_view _left;
+  table_view _conditional;
+  null_equality _nulls;
+  std::shared_ptr<row::equality::preprocessed_table> _preprocessed;
+  std::unique_ptr<table_device_view, std::function<void(table_device_view*)>> _conditional_device;
+  rmm::device_uvector<size_type> _heads;
+  rmm::device_uvector<size_type> _next;
+  rmm::device_uvector<uint32_t> _matches;
+  bool _sealed{false};
+  bool _anti{false};
+  std::size_t _output_size{0};
+};
 
 namespace {
 struct mixed_single_gather_mask {
@@ -286,6 +436,35 @@ std::unique_ptr<rmm::device_uvector<size_type>> mixed_join_semi(
 }
 
 }  // namespace detail
+
+mixed_left_join_state::mixed_left_join_state(table_view const& equality,
+                                             table_view const& conditional,
+                                             null_equality nulls,
+                                             rmm::cuda_stream_view stream,
+                                             rmm::device_async_resource_ref mr)
+  : _impl{std::make_unique<detail::mixed_left_join_state>(equality, conditional, nulls, stream, mr)}
+{
+}
+mixed_left_join_state::~mixed_left_join_state() = default;
+void mixed_left_join_state::consume(table_view const& equality,
+                                    table_view const& conditional,
+                                    ast::expression const& predicate,
+                                    rmm::cuda_stream_view stream,
+                                    rmm::device_async_resource_ref mr)
+{
+  _impl->consume(equality, conditional, predicate, stream, mr);
+}
+void mixed_left_join_state::seal(bool anti, rmm::cuda_stream_view stream,
+                                 rmm::device_async_resource_ref mr)
+{
+  _impl->seal(anti, stream, mr);
+}
+std::size_t mixed_left_join_state::output_size() const { return _impl->output_size(); }
+std::unique_ptr<rmm::device_uvector<size_type>> mixed_left_join_state::materialize_indices(
+  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+{
+  return _impl->materialize_indices(stream, mr);
+}
 
 std::unique_ptr<rmm::device_uvector<size_type>> mixed_left_semi_join(
   table_view const& left_equality,

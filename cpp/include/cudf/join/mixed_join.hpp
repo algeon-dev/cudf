@@ -34,7 +34,43 @@ namespace CUDF_EXPORT cudf {
 namespace detail {
 class mixed_full_join_size_data;
 class mixed_left_semi_anti_join_size_data;
+class mixed_left_join_state;
 }  // namespace detail
+
+/**
+ * @brief Cumulative keyed mixed-join membership for a retained logical-left table.
+ *
+ * Every left row retains its identity, including duplicate keys and payloads.
+ * `consume` adds matches from successive right batches; it never clears earlier
+ * matches. `seal` declares end of input and selects semi or anti semantics.
+ * No indices or final count are available until sealing. All calls must use
+ * the construction stream and resource. Left storage must outlive this state;
+ * right storage must remain live until its consume work completes.
+ */
+class mixed_left_join_state {
+ public:
+  mixed_left_join_state(table_view const& left_equality,
+                        table_view const& left_conditional,
+                        null_equality compare_nulls,
+                        rmm::cuda_stream_view stream,
+                        rmm::device_async_resource_ref mr);
+  ~mixed_left_join_state();
+  mixed_left_join_state(mixed_left_join_state const&) = delete;
+  mixed_left_join_state& operator=(mixed_left_join_state const&) = delete;
+
+  void consume(table_view const& right_equality,
+               table_view const& right_conditional,
+               ast::expression const& predicate,
+               rmm::cuda_stream_view stream,
+               rmm::device_async_resource_ref mr);
+  void seal(bool anti, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr);
+  [[nodiscard]] std::size_t output_size() const;
+  [[nodiscard]] std::unique_ptr<rmm::device_uvector<size_type>> materialize_indices(
+    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const;
+
+ private:
+  std::unique_ptr<detail::mixed_left_join_state> _impl;
+};
 
 /**
  * @brief Retained exact output-size data for a mixed left semi or left anti join.
