@@ -109,7 +109,7 @@ function(cudf_patch_cuco_exception_safety cuco_source_dir)
   # Post-condition: `size()` and `retrieve_all()` must each release their
   # temporary storage through exactly one path, the unique_ptr owner. Any
   # surviving explicit deallocate of the owned pointer is a double free that
-  # the Nexus adaptor reports as an unknown-pointer invariant violation.
+  # the Algeon adaptor reports as an unknown-pointer invariant violation.
   _cudf_count_literal("${contents}" "auto d_temp_storage_owner = std::unique_ptr<char"
     final_owner_count)
   if(NOT final_owner_count EQUAL 2)
