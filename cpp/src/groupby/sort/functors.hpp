@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -54,6 +54,11 @@ struct store_result_functor {
    *
    * Computes the grouped values from @p values on first invocation and returns
    * the stored result on subsequent invocation
+   *
+   * Grouped values are @p values gathered by the key sort order. Sorted values
+   * cannot stand in for them: ARGMIN and ARGMAX map a position in the grouped
+   * values back to a row through the key sort order, and NTH_ELEMENT and
+   * COLLECT_LIST read the rows of a group in that order.
    */
   column_view get_grouped_values()
   {
@@ -61,14 +66,8 @@ struct store_result_functor {
 
     // TODO (dm): After implementing single pass multi-agg, explore making a
     //            cache of all grouped value columns rather than one at a time
-    if (grouped_values)
-      return grouped_values->view();
-    else if (sorted_values)
-      // In scan, it wouldn't be ok to return sorted values when asked for grouped values.
-      // It's overridden in scan implementation.
-      return sorted_values->view();
-    else
-      return (grouped_values = helper.grouped_values(values, stream, mr))->view();
+    if (!grouped_values) { grouped_values = helper.grouped_values(values, stream, mr); }
+    return grouped_values->view();
   };
 
   /**

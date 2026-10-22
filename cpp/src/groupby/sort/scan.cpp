@@ -47,20 +47,6 @@ struct scan_result_functor final : store_result_functor {
   {
     CUDF_FAIL("Unsupported groupby scan aggregation");
   }
-
- private:
-  column_view get_grouped_values()
-  {
-    // early exit if presorted
-    if (is_presorted()) { return values; }
-
-    // TODO (dm): After implementing single pass multi-agg, explore making a
-    //            cache of all grouped value columns rather than one at a time
-    if (grouped_values)
-      return grouped_values->view();
-    else
-      return (grouped_values = helper.grouped_values(values, stream, mr))->view();
-  };
 };
 
 template <>
