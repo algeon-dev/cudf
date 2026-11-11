@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -425,9 +426,20 @@ class aggregate_reader_metadata {
    *
    * @return Parquet file metadatas
    */
-  [[nodiscard]] std::vector<FileMetaData> get_parquet_metadatas() const
+  [[nodiscard]] std::vector<FileMetaData> get_parquet_metadatas() const&
   {
     return std::vector<FileMetaData>{per_file_metadata.begin(), per_file_metadata.end()};
+  }
+
+  /**
+   * @brief Move out Parquet file metadatas
+   *
+   * @return Parquet file metadatas
+   */
+  [[nodiscard]] std::vector<FileMetaData> get_parquet_metadatas() &&
+  {
+    return std::vector<FileMetaData>{std::make_move_iterator(per_file_metadata.begin()),
+                                     std::make_move_iterator(per_file_metadata.end())};
   }
 
   /**
