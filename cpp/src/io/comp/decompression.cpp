@@ -23,10 +23,13 @@
 #include <zlib.h>  // uncompress
 #include <zstd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>  // memset
 #include <future>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 namespace cudf::io::detail {
 
@@ -614,6 +617,44 @@ void host_decompress(compression_type compression,
   CUDF_FAIL("Invalid LIBCUDF_HOST_DECOMPRESSION value: " + env_var);
 }
 
+/// Which decompressor's scratch requirement `get_decompression_scratch_size` reports for a codec.
+enum class scratch_source : uint8_t { NONE, NVCOMP, BROTLI_KERNEL };
+
+// Reads LIBCUDF_HOST_DECOMPRESSION and LIBCUDF_NVCOMP_POLICY, so callers sizing many inputs of
+// one codec resolve it once rather than once per input.
+[[nodiscard]] scratch_source get_scratch_source(compression_type compression)
+{
+  if (compression == compression_type::NONE or
+      get_host_engine_state(compression) == host_engine_state::ON) {
+    return scratch_source::NONE;
+  }
+
+  auto const nvcomp_type     = to_nvcomp_compression(compression);
+  auto const nvcomp_disabled = nvcomp_type.has_value()
+                                 ? nvcomp::is_decompression_disabled(*nvcomp_type)
+                                 : "invalid compression type";
+  if (not nvcomp_disabled) { return scratch_source::NVCOMP; }
+
+  // only Brotli kernel requires scratch memory
+  if (compression == compression_type::BROTLI) { return scratch_source::BROTLI_KERNEL; }
+  return scratch_source::NONE;
+}
+
+[[nodiscard]] size_t get_decompression_scratch_size(decompression_info const& di,
+                                                    scratch_source source)
+{
+  switch (source) {
+    case scratch_source::NVCOMP:
+      return nvcomp::batched_decompress_temp_size(to_nvcomp_compression(di.type).value(),
+                                                  di.num_pages,
+                                                  di.max_page_decompressed_size,
+                                                  di.total_decompressed_size);
+    case scratch_source::BROTLI_KERNEL: return get_gpu_debrotli_scratch_size(di.num_pages);
+    case scratch_source::NONE: return 0;
+  }
+  CUDF_FAIL("Invalid scratch source");
+}
+
 }  // namespace
 
 size_t get_uncompressed_size(compression_type compression, host_span<uint8_t const> src)
@@ -623,23 +664,26 @@ size_t get_uncompressed_size(compression_type compression, host_span<uint8_t con
 
 [[nodiscard]] size_t get_decompression_scratch_size(decompression_info const& di)
 {
-  if (di.type == compression_type::NONE or
-      get_host_engine_state(di.type) == host_engine_state::ON) {
-    return 0;
-  }
+  return get_decompression_scratch_size(di, get_scratch_source(di.type));
+}
 
-  auto const nvcomp_type     = to_nvcomp_compression(di.type);
-  auto const nvcomp_disabled = nvcomp_type.has_value()
-                                 ? nvcomp::is_decompression_disabled(*nvcomp_type)
-                                 : "invalid compression type";
-  if (not nvcomp_disabled) {
-    return nvcomp::batched_decompress_temp_size(
-      nvcomp_type.value(), di.num_pages, di.max_page_decompressed_size, di.total_decompressed_size);
-  }
-
-  if (di.type == compression_type::BROTLI) return get_gpu_debrotli_scratch_size(di.num_pages);
-  // only Brotli kernel requires scratch memory
-  return 0;
+void get_decompression_scratch_sizes(host_span<decompression_info const> infos,
+                                     host_span<size_t> scratch_sizes)
+{
+  CUDF_EXPECTS(infos.size() == scratch_sizes.size(),
+               "Decompression info and scratch size spans must have the same length",
+               std::invalid_argument);
+  // Sources are resolved in first-appearance order so that an unsupported codec or an invalid
+  // environment value fails on the same element as the per-element function would.
+  std::vector<std::pair<compression_type, scratch_source>> sources;
+  std::transform(infos.begin(), infos.end(), scratch_sizes.begin(), [&](auto const& di) {
+    auto it = std::find_if(
+      sources.begin(), sources.end(), [&](auto const& entry) { return entry.first == di.type; });
+    if (it == sources.end()) {
+      it = sources.insert(sources.end(), {di.type, get_scratch_source(di.type)});
+    }
+    return get_decompression_scratch_size(di, it->second);
+  });
 }
 
 [[nodiscard]] size_t get_decompression_scratch_size_ex(

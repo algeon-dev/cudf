@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2018-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -40,6 +40,20 @@ struct decompression_info {
  * @brief Returns total scratch space required based on computed decompression_info data.
  */
 [[nodiscard]] size_t get_decompression_scratch_size(decompression_info const& di);
+
+/**
+ * @brief Computes `get_decompression_scratch_size` for each element of `infos`.
+ *
+ * The decompressor for each compression type, which depends on environment variables, is
+ * resolved once per call instead of once per element.
+ *
+ * @throws std::invalid_argument if `infos` and `scratch_sizes` differ in length
+ *
+ * @param infos Decompression information, for example one entry per page
+ * @param scratch_sizes Output scratch size for each element of `infos`
+ */
+void get_decompression_scratch_sizes(host_span<decompression_info const> infos,
+                                     host_span<size_t> scratch_sizes);
 
 /**
  * @brief Returns total scratch space required based on the compressed input data.
